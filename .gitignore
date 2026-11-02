@@ -46,3 +46,9 @@ e2e-results/
 
 # Built programs
 bin/
+
+# Local notes, logs and course material that stay out of the fork
+IREAD.md
+*.log
+Midterm Mastery Part 2.pdf
+terraform/.terraform.lock.hcl

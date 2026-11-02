@@ -28,9 +28,35 @@ const (
 	maxChunks       = 65536
 )
 
-// readTimeout is how long the server may stay quiet. It is a variable only so tests can
-// shorten it.
-var readTimeout = 2 * time.Second
+// DefaultReadTimeout is how long the server may stay quiet, unless SetReadTimeout changes it.
+const DefaultReadTimeout = 2 * time.Second
+
+// readTimeout is how long the server may stay quiet. It is a variable so tests and
+// SetReadTimeout can change it.
+var readTimeout = DefaultReadTimeout
+
+// SetReadTimeout changes how long the server may stay quiet before a round of reading ends.
+//
+// Inputs: timeout is the new quiet period; it should be more than zero.
+// Returns: nothing.
+// Errors: none.
+// Side effects: changes the timeout for every later Fetch. Call it once at startup, before
+// any Fetch runs, since it is not synchronized with running fetches.
+func SetReadTimeout(timeout time.Duration) {
+	readTimeout = timeout
+}
+
+// FetchStats describes how one download went, so experiments can see why it was slow or failed.
+type FetchStats struct {
+	// OpenAttempts is how many OPEN requests were sent, each on a fresh socket.
+	OpenAttempts int
+	// RetryRounds is how many rounds of RETY requests were sent.
+	RetryRounds int
+	// Chunks is how many chunks the server announced, or 0 if no file data arrived.
+	Chunks int
+	// Missing is how many chunks were still missing when the download ended.
+	Missing int
+}
 
 // ServerError is returned when the server answers a request with "ERR <message>".
 // Message holds the text after "ERR " (for example "file-not-found").
@@ -111,6 +137,18 @@ func RunClient(args []string) {
 // Side effects: opens and closes a UDP socket, writes OPEN and RETY datagrams, sets read
 // deadlines on that socket, and logs progress to stderr.
 func Fetch(address string, filename string) ([]byte, error) {
+	file_data, _, err := FetchWithStats(address, filename)
+	return file_data, err
+}
+
+// FetchWithStats is Fetch, but it also reports how many OPEN attempts and RETY rounds the
+// download took.
+//
+// Inputs, errors and side effects: as for Fetch.
+// Returns: the complete contents of the file, and the FetchStats of the download. The stats
+// are filled in on failure too, up to the point where the download stopped.
+func FetchWithStats(address string, filename string) ([]byte, FetchStats, error) {
+	var stats FetchStats
 	var conn *net.UDPConn
 	defer func() {
 		if conn != nil {
@@ -124,19 +162,21 @@ func Fetch(address string, filename string) ([]byte, error) {
 		var err error
 		conn, err = redial(conn, address)
 		if err != nil {
-			return nil, err
+			return nil, stats, err
 		}
 		_, err = fmt.Fprintf(conn, "OPEN %v", filename)
 		if err != nil {
-			return nil, fmt.Errorf("sending OPEN: %w", err)
+			return nil, stats, fmt.Errorf("sending OPEN: %w", err)
 		}
+		stats.OpenAttempts++
 		num_chunks, err = readChunks(conn, chunks)
 		if err != nil {
-			return nil, err
+			return nil, stats, err
 		}
 	}
+	stats.Chunks = num_chunks
 	if num_chunks == 0 {
-		return nil, ErrNoData
+		return nil, stats, ErrNoData
 	}
 
 	silent := false
@@ -150,34 +190,36 @@ func Fetch(address string, filename string) ([]byte, error) {
 			var err error
 			conn, err = redial(conn, address)
 			if err != nil {
-				return nil, err
+				return nil, stats, err
 			}
 		}
 		fmt.Fprintf(os.Stderr, "Missing chunks %v, retrying\n", missing)
+		stats.RetryRounds++
 		for _, id := range missing {
 			_, err := fmt.Fprintf(conn, "RETY %v %v", filename, id)
 			if err != nil {
-				return nil, fmt.Errorf("sending RETY: %w", err)
+				return nil, stats, fmt.Errorf("sending RETY: %w", err)
 			}
 		}
 		before := len(chunks)
 		_, err := readChunks(conn, chunks)
 		if err != nil {
-			return nil, err
+			return nil, stats, err
 		}
 		silent = len(chunks) == before
 	}
 
 	missing := missingChunkIds(chunks, num_chunks)
+	stats.Missing = len(missing)
 	if len(missing) > 0 {
-		return nil, fmt.Errorf("%w: %v", ErrIncomplete, missing)
+		return nil, stats, fmt.Errorf("%w: %v", ErrIncomplete, missing)
 	}
 
 	packs := make([]transferdata.TCP_Pack, num_chunks)
 	for id := 1; id <= num_chunks; id++ {
 		packs[id-1] = chunks[id]
 	}
-	return transferdata.RecombineData(packs), nil
+	return transferdata.RecombineData(packs), stats, nil
 }
 
 // redial closes old (if not nil) and opens a new UDP socket to one of address's IPv4

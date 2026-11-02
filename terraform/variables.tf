@@ -57,6 +57,17 @@ variable "max_inflight" {
   default     = 4
 }
 
+variable "gateway_read_timeout_ms" {
+  type        = number
+  description = "Milliseconds the backend may stay quiet before the gateway's UDP client ends a round of reading (READ_TIMEOUT_MS)"
+  default     = 2000
+
+  validation {
+    condition     = var.gateway_read_timeout_ms >= 1
+    error_message = "gateway_read_timeout_ms must be 1 or more."
+  }
+}
+
 variable "backend_workers" {
   type        = number
   description = "Requests one backend task handles at once (WORKERS)"

@@ -28,6 +28,8 @@ import (
  *                  Defaults to 4. Keep it at or below the UDP server's -workers. Env MAX_INFLIGHT.
  *  -queue-wait=SECONDS how long a request waits for a free transfer slot before getting 503.
  *                  Defaults to 5. Env QUEUE_WAIT.
+ *  -read-timeout-ms=N how long the UDP server may stay quiet before the client ends a round of
+ *                  reading (1 or more). Defaults to 2000. UDP only. Env READ_TIMEOUT_MS.
  *  -drain=SECONDS time between /health turning 503 and the process exiting after SIGTERM, so
  *                  the load balancer stops sending requests first. Defaults to 5.
  */
@@ -37,6 +39,7 @@ func main() {
 	transport := envOr("TRANSPORT", "udp")
 	maxInFlight := 4
 	queueWait := gateway.DefaultQueueWait
+	readTimeout := udp.DefaultReadTimeout
 	drain := 5 * time.Second
 
 	var err error
@@ -52,6 +55,12 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+	if os.Getenv("READ_TIMEOUT_MS") != "" {
+		readTimeout, err = parseMilliseconds("READ_TIMEOUT_MS=" + os.Getenv("READ_TIMEOUT_MS"))
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 	for _, option := range os.Args[1:] {
 		if strings.HasPrefix(option, "-listen=") {
 			listen = strings.SplitN(option, "=", 2)[1]
@@ -63,6 +72,8 @@ func main() {
 			maxInFlight, err = parseMaxInFlight(option)
 		} else if strings.HasPrefix(option, "-queue-wait=") {
 			queueWait, err = parseSeconds(option)
+		} else if strings.HasPrefix(option, "-read-timeout-ms=") {
+			readTimeout, err = parseMilliseconds(option)
 		} else if strings.HasPrefix(option, "-drain=") {
 			drain, err = parseSeconds(option)
 		}
@@ -76,8 +87,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	fmt.Printf("Serving http://%v/files, fetching over %v from %v (up to %v at once)\n", listen, transport, upstream, maxInFlight)
-	frontend := gateway.New(upstream, fetch, maxInFlight, queueWait)
+	udp.SetReadTimeout(readTimeout)
+
+	fmt.Printf("Serving http://%v/files, fetching over %v from %v (up to %v at once, read timeout %v)\n", listen, transport, upstream, maxInFlight, readTimeout)
+	frontend := gateway.NewWithStats(upstream, fetch, maxInFlight, queueWait)
 
 	// On SIGTERM (a scale-in or deploy) report unhealthy first so the load balancer stops
 	// sending new requests, wait for it to notice, let running downloads finish, then exit.
@@ -104,15 +117,15 @@ func main() {
 // fetcherFor picks the client that downloads files from the upstream server.
 //
 // Inputs: transport is "udp" or "tcp".
-// Returns: udp.Fetch for "udp" and tcp.Fetch for "tcp".
+// Returns: udp.FetchWithStats for "udp" and tcp.Fetch (with zero stats) for "tcp".
 // Errors: returns an error naming the value when it is neither.
 // Side effects: none.
-func fetcherFor(transport string) (gateway.Fetcher, error) {
+func fetcherFor(transport string) (gateway.StatsFetcher, error) {
 	switch transport {
 	case "udp":
-		return udp.Fetch, nil
+		return udp.FetchWithStats, nil
 	case "tcp":
-		return tcp.Fetch, nil
+		return gateway.WithoutStats(tcp.Fetch), nil
 	}
 	return nil, fmt.Errorf("invalid transport %q: expected udp or tcp", transport)
 }
@@ -140,6 +153,23 @@ func parseSeconds(option string) (time.Duration, error) {
 		return 0, fmt.Errorf("invalid %v: expected an integer of 0 or more", option)
 	}
 	return time.Duration(seconds) * time.Second, nil
+}
+
+// parseMilliseconds reads the number of milliseconds out of an option such as
+// "-read-timeout-ms=2000".
+//
+// Inputs: option is a command line argument of the form "-name=N".
+// Returns: N milliseconds as a duration.
+// Errors: returns an error naming the option when N is missing, is not an integer, or is
+// less than 1.
+// Side effects: none.
+func parseMilliseconds(option string) (time.Duration, error) {
+	value := strings.SplitN(option, "=", 2)[1]
+	milliseconds, err := strconv.Atoi(value)
+	if err != nil || milliseconds < 1 {
+		return 0, fmt.Errorf("invalid %v: expected an integer of 1 or more", option)
+	}
+	return time.Duration(milliseconds) * time.Millisecond, nil
 }
 
 // parseMaxInFlight reads the number out of a "-max-inflight=N" option.

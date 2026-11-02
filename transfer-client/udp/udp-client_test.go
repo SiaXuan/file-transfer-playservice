@@ -131,3 +131,25 @@ func TestFetchRedialsWhenRetryRoundGetsNoReply(t *testing.T) {
 		t.Errorf("source ports = %v, want the second RETY from a new port", ports)
 	}
 }
+
+func TestFetchWithStatsCountsAttemptsAndRounds(t *testing.T) {
+	server := startTestServer(t, func(request string, count int) [][]byte {
+		switch {
+		case count == 1:
+			return nil // first OPEN is "lost"
+		case strings.HasPrefix(request, "OPEN"):
+			return [][]byte{chunk(1, 2, strings.Repeat("a", 64))} // chunk 2 is "lost"
+		case count == 3:
+			return nil // first RETY gets no answer
+		default:
+			return [][]byte{chunk(2, 2, "two")}
+		}
+	})
+
+	_, stats, err := FetchWithStats(server.address(), "a.txt")
+
+	want := FetchStats{OpenAttempts: 2, RetryRounds: 2, Chunks: 2, Missing: 0}
+	if err != nil || stats != want {
+		t.Errorf("FetchWithStats stats = %+v, %v, want %+v", stats, err, want)
+	}
+}

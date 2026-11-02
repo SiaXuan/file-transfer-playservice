@@ -219,3 +219,25 @@ func TestBusyGatewayAnswers503WithRetryAfter(t *testing.T) {
 		t.Errorf("Retry-After = %q, want 1", recorder.Header().Get("Retry-After"))
 	}
 }
+
+func TestStatsAreReportedInHeaders(t *testing.T) {
+	fetch := func(string, string) ([]byte, udp.FetchStats, error) {
+		return nil, udp.FetchStats{OpenAttempts: 2, RetryRounds: 3, Chunks: 10, Missing: 4}, udp.ErrIncomplete
+	}
+	recorder := get(NewWithStats("u", fetch, 1, time.Second).Router, "/files?name=a.txt")
+
+	if recorder.Code != http.StatusGatewayTimeout {
+		t.Fatalf("status = %v, want 504", recorder.Code)
+	}
+	want := map[string]string{"X-Open-Attempts": "2", "X-Retry-Rounds": "3", "X-Chunks": "10", "X-Missing-Chunks": "4"}
+	for header, value := range want {
+		if got := recorder.Header().Get(header); got != value {
+			t.Errorf("%v = %q, want %q", header, got, value)
+		}
+	}
+	for _, header := range []string{"X-Queue-Wait-Ms", "X-Fetch-Ms"} {
+		if recorder.Header().Get(header) == "" {
+			t.Errorf("%v header is missing", header)
+		}
+	}
+}

@@ -5,6 +5,7 @@ package gateway
 
 import (
 	"errors"
+	"fmt"
 	"mime"
 	"net/http"
 	"path/filepath"
@@ -29,6 +30,18 @@ const DefaultQueueWait = 5 * time.Second
 // Fetcher downloads one file from an FTP_6650 server. Production code passes udp.Fetch or tcp.Fetch;
 // tests pass a fake so the handler can be tested without a network.
 type Fetcher func(address string, filename string) ([]byte, error)
+
+// StatsFetcher is a Fetcher that also reports how the download went. Production code passes
+// udp.FetchWithStats; WithoutStats adapts any other Fetcher.
+type StatsFetcher func(address string, filename string) ([]byte, udp.FetchStats, error)
+
+// WithoutStats adapts a Fetcher that reports no stats into a StatsFetcher, with zero stats.
+func WithoutStats(fetch Fetcher) StatsFetcher {
+	return func(address string, filename string) ([]byte, udp.FetchStats, error) {
+		file_data, err := fetch(address, filename)
+		return file_data, udp.FetchStats{}, err
+	}
+}
 
 // Gateway is the HTTP frontend: a Gin engine plus the state a graceful shutdown needs.
 type Gateway struct {
@@ -76,6 +89,13 @@ func (gateway *Gateway) WaitIdle(timeout time.Duration) bool {
 // with no capacity would block every request forever.
 // Side effects: none until the returned router serves requests.
 func New(upstream string, fetch Fetcher, maxInFlight int, queueWait time.Duration) *Gateway {
+	return NewWithStats(upstream, WithoutStats(fetch), maxInFlight, queueWait)
+}
+
+// NewWithStats is New for a fetcher that reports FetchStats. Each GET /files response then
+// carries the queue wait, the fetch time and the stats in X- headers, and each download is
+// logged as one "FETCH ..." line.
+func NewWithStats(upstream string, fetch StatsFetcher, maxInFlight int, queueWait time.Duration) *Gateway {
 	// inflight is a counting semaphore: it lets at most cap(inflight) transfers run at once.
 	//
 	// If you know sync.Mutex: a Mutex is a semaphore with exactly one permit. Lock takes the
@@ -136,7 +156,7 @@ func (gateway *Gateway) handleHealthCheck() gin.HandlerFunc {
 // within queueWait it replies 503 with a Retry-After header, also without calling fetch.
 // Side effects: each request waits for a semaphore permit, then opens a UDP socket to the
 // upstream and exchanges datagrams with it (inside fetch).
-func handleGetFile(upstream string, fetch Fetcher, inflight chan struct{}, queueWait time.Duration) gin.HandlerFunc {
+func handleGetFile(upstream string, fetch StatsFetcher, inflight chan struct{}, queueWait time.Duration) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		name := c.Query("name")
 		err := validateName(name)
@@ -146,6 +166,7 @@ func handleGetFile(upstream string, fetch Fetcher, inflight chan struct{}, queue
 		}
 
 		// Acquire a permit, or give up if the client leaves or the wait runs out.
+		wait_start := time.Now()
 		timer := time.NewTimer(queueWait)
 		defer timer.Stop()
 		select {
@@ -155,15 +176,20 @@ func handleGetFile(upstream string, fetch Fetcher, inflight chan struct{}, queue
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		case <-timer.C:
+			c.Header("X-Queue-Wait-Ms", strconv.FormatInt(time.Since(wait_start).Milliseconds(), 10))
 			c.Header("Retry-After", strconv.Itoa(1))
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "the gateway is busy, try again"})
 			return
 		}
+		waited := time.Since(wait_start)
 
-		file_data, err := fetch(upstream, name)
+		fetch_start := time.Now()
+		file_data, stats, err := fetch(upstream, name)
+		fetched := time.Since(fetch_start)
 		if err != nil {
 			c.Error(err)
 			status, message := statusFor(err)
+			reportFetch(c, name, status, waited, fetched, stats)
 			c.JSON(status, gin.H{"error": message})
 			return
 		}
@@ -172,9 +198,32 @@ func handleGetFile(upstream string, fetch Fetcher, inflight chan struct{}, queue
 		if content_type == "" {
 			content_type = "application/octet-stream"
 		}
+		reportFetch(c, name, http.StatusOK, waited, fetched, stats)
 		c.Header("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
 		c.Data(http.StatusOK, content_type, file_data)
 	}
+}
+
+// reportFetch records how one download went, for experiments: in response headers, so a load
+// test can save it per request, and in one "FETCH ..." log line, so CloudWatch Logs Insights
+// can aggregate it.
+//
+// Inputs: c is the request being answered; name is the file; status is the HTTP status about
+// to be sent; waited is the time spent waiting for a permit; fetched is the time fetch took;
+// stats is what fetch reported.
+// Returns: nothing.
+// Errors: none.
+// Side effects: sets response headers on c (so call it before writing the body) and prints
+// one line to stdout.
+func reportFetch(c *gin.Context, name string, status int, waited time.Duration, fetched time.Duration, stats udp.FetchStats) {
+	c.Header("X-Queue-Wait-Ms", strconv.FormatInt(waited.Milliseconds(), 10))
+	c.Header("X-Fetch-Ms", strconv.FormatInt(fetched.Milliseconds(), 10))
+	c.Header("X-Open-Attempts", strconv.Itoa(stats.OpenAttempts))
+	c.Header("X-Retry-Rounds", strconv.Itoa(stats.RetryRounds))
+	c.Header("X-Chunks", strconv.Itoa(stats.Chunks))
+	c.Header("X-Missing-Chunks", strconv.Itoa(stats.Missing))
+	fmt.Printf("FETCH name=%v status=%v queue_ms=%v fetch_ms=%v open_attempts=%v retry_rounds=%v chunks=%v missing=%v\n",
+		name, status, waited.Milliseconds(), fetched.Milliseconds(), stats.OpenAttempts, stats.RetryRounds, stats.Chunks, stats.Missing)
 }
 
 // validateName checks that name is safe and usable as an FTP_6650 file name.

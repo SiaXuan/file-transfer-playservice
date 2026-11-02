@@ -89,6 +89,7 @@ resource "aws_ecs_task_definition" "gateway" {
       { name = "TRANSPORT", value = "udp" },
       { name = "UPSTREAM", value = "${aws_lb.backend.dns_name}:8080" },
       { name = "MAX_INFLIGHT", value = tostring(var.max_inflight) },
+      { name = "READ_TIMEOUT_MS", value = tostring(var.gateway_read_timeout_ms) },
     ]
     logConfiguration = {
       logDriver = "awslogs"
